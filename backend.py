@@ -45,16 +45,15 @@ def prepare_latest_snapshot(df):
     if "MONTH_PRD" in df.columns:
         latest_df = (
             df.sort_values(["MSISDN", "SERVICE_NAME", "MONTH_PRD"])
-              .groupby(["MSISDN", "SERVICE_NAME"], as_index=False)
-              .tail(1)
-              .copy()
+            .groupby(["MSISDN", "SERVICE_NAME"], as_index=False)
+            .tail(1)
+            .copy()
         )
     else:
         latest_df = (
             df.drop_duplicates(subset=["MSISDN", "SERVICE_NAME"], keep="last")
-              .copy()
+            .copy()
         )
-
     return latest_df
 
 
@@ -119,6 +118,20 @@ def train_model_from_repo_data():
         "NON-CHURN"
     )
 
+    latest_snapshot["risk_segment"] = latest_snapshot["churn_probability"].apply(
+        lambda x: classify_risk(x, threshold)
+    )
+
+    latest_snapshot["customer_value"] = latest_snapshot.apply(compute_customer_value, axis=1)
+    latest_snapshot["priority_score"] = latest_snapshot["churn_probability"] * latest_snapshot["customer_value"]
+    latest_snapshot["priority_level"] = latest_snapshot["priority_score"].apply(classify_priority)
+
+    intelligence_cols = latest_snapshot.apply(
+        lambda row: pd.Series(build_decision_intelligence_row(row, threshold)),
+        axis=1
+    )
+    latest_snapshot = pd.concat([latest_snapshot, intelligence_cols], axis=1)
+
     return {
         "model": model,
         "threshold": threshold,
@@ -133,6 +146,25 @@ def classify_risk(prob, threshold):
     elif prob >= threshold * 0.7:
         return "MEDIUM RISK"
     return "LOW RISK"
+
+
+def compute_customer_value(row):
+    current_spend = float(row.get("tot_amount_w_tax", 0) or 0)
+    avg_spend = float(row.get("spend_avg_last3", 0) or 0)
+    lag1 = float(row.get("spend_lag_1", 0) or 0)
+
+    value = (0.5 * current_spend) + (0.3 * avg_spend) + (0.2 * lag1)
+    return round(max(value, 0.0), 4)
+
+
+def classify_priority(score):
+    if score >= 70:
+        return "CRITICAL"
+    elif score >= 35:
+        return "HIGH"
+    elif score >= 15:
+        return "MEDIUM"
+    return "LOW"
 
 
 def get_services_for_msisdn(msisdn, artifacts):
@@ -178,6 +210,118 @@ def explain_prediction(model, row_df, features):
     return exp_df, reasons
 
 
+def recommend_next_best_action(row, threshold):
+    prob = float(row.get("churn_probability", 0))
+    risk = classify_risk(prob, threshold)
+
+    spend_trend_ratio = float(row.get("spend_trend_ratio", 0) or 0)
+    active_months = float(row.get("consecutive_active_months", 0) or 0)
+    service_risk_woe = float(row.get("service_risk_woe", 0) or 0)
+    customer_value = compute_customer_value(row)
+
+    if risk == "HIGH RISK" and customer_value >= 50 and spend_trend_ratio < 0.8:
+        return {
+            "recommended_action": "Premium retention offer",
+            "suggested_channel": "Call Center + SMS",
+            "business_reason": "High-value customer with strong churn risk and declining spend pattern."
+        }
+
+    if risk == "HIGH RISK" and active_months <= 3:
+        return {
+            "recommended_action": "Early-life engagement campaign",
+            "suggested_channel": "SMS + App Push",
+            "business_reason": "New or weakly engaged customer showing early churn signals."
+        }
+
+    if risk == "HIGH RISK" and service_risk_woe > 0:
+        return {
+            "recommended_action": "Service quality check and targeted retention package",
+            "suggested_channel": "Call Center",
+            "business_reason": "Service-level risk and behavioral indicators suggest proactive intervention."
+        }
+
+    if risk == "MEDIUM RISK" and customer_value >= 30:
+        return {
+            "recommended_action": "Personalized loyalty offer",
+            "suggested_channel": "SMS",
+            "business_reason": "Customer has moderate churn risk but meaningful commercial value."
+        }
+
+    if risk == "MEDIUM RISK":
+        return {
+            "recommended_action": "Reminder and engagement campaign",
+            "suggested_channel": "SMS + Email",
+            "business_reason": "Moderate churn indicators suggest low-cost retention action."
+        }
+
+    if customer_value >= 50:
+        return {
+            "recommended_action": "Upsell or bundle recommendation",
+            "suggested_channel": "SMS + App Push",
+            "business_reason": "Customer is stable and commercially valuable, making upsell more suitable than retention cost."
+        }
+
+    return {
+        "recommended_action": "No immediate action",
+        "suggested_channel": "None",
+        "business_reason": "Customer currently shows low churn risk and low intervention need."
+    }
+
+
+def build_decision_intelligence_row(row, threshold):
+    action_info = recommend_next_best_action(row, threshold)
+    customer_value = compute_customer_value(row)
+    priority_score = float(row.get("churn_probability", 0)) * customer_value
+
+    return {
+        "customer_value": customer_value,
+        "priority_score": round(priority_score, 4),
+        "priority_level": classify_priority(priority_score),
+        "recommended_action": action_info["recommended_action"],
+        "suggested_channel": action_info["suggested_channel"],
+        "business_reason": action_info["business_reason"]
+    }
+
+
+def simulate_what_if(row_df, model, features, threshold, action_name):
+    sim_df = row_df.copy()
+
+    if action_name == "Retention Discount":
+        sim_df["tot_amount_w_tax"] = sim_df["tot_amount_w_tax"] * 1.10
+        sim_df["spend_avg_last3"] = sim_df["spend_avg_last3"] * 1.08
+        sim_df["spend_trend_ratio"] = sim_df["spend_trend_ratio"] * 1.15
+
+    elif action_name == "Loyalty Reward":
+        sim_df["consecutive_active_months"] = sim_df["consecutive_active_months"] + 1
+        sim_df["spend_trend_ratio"] = sim_df["spend_trend_ratio"] * 1.05
+
+    elif action_name == "Service Quality Improvement":
+        sim_df["service_risk_woe"] = sim_df["service_risk_woe"] * 0.75
+        sim_df["spend_trend_ratio"] = sim_df["spend_trend_ratio"] * 1.05
+
+    elif action_name == "Bundle Upgrade":
+        sim_df["tot_amount_w_tax"] = sim_df["tot_amount_w_tax"] * 1.12
+        sim_df["spend_avg_last3"] = sim_df["spend_avg_last3"] * 1.10
+        sim_df["consecutive_active_months"] = sim_df["consecutive_active_months"] + 1
+
+    before_prob = float(model.predict_proba(row_df[features])[:, 1][0])
+    after_prob = float(model.predict_proba(sim_df[features])[:, 1][0])
+
+    before_risk = classify_risk(before_prob, threshold)
+    after_risk = classify_risk(after_prob, threshold)
+
+    delta = after_prob - before_prob
+
+    return {
+        "before_probability": before_prob,
+        "after_probability": after_prob,
+        "before_risk": before_risk,
+        "after_risk": after_risk,
+        "probability_change": delta,
+        "simulated_row": sim_df
+    }
+
+
 def predict_customer(msisdn, service_name, artifacts):
     msisdn = str(msisdn).strip()
     service_name = str(service_name).strip()
@@ -204,10 +348,21 @@ def predict_customer(msisdn, service_name, artifacts):
 
     exp_df, reasons = explain_prediction(model, row_df, artifacts["features"])
 
+    intelligence = build_decision_intelligence_row(
+        {**row_df.iloc[0].to_dict(), "churn_probability": prob},
+        threshold
+    )
+
     result_df = row_df.copy()
     result_df["churn_probability"] = prob
     result_df["prediction"] = "CHURN" if pred == 1 else "NON-CHURN"
     result_df["risk_segment"] = risk
+    result_df["customer_value"] = intelligence["customer_value"]
+    result_df["priority_score"] = intelligence["priority_score"]
+    result_df["priority_level"] = intelligence["priority_level"]
+    result_df["recommended_action"] = intelligence["recommended_action"]
+    result_df["suggested_channel"] = intelligence["suggested_channel"]
+    result_df["business_reason"] = intelligence["business_reason"]
 
     return {
         "probability": prob,
@@ -216,7 +371,13 @@ def predict_customer(msisdn, service_name, artifacts):
         "reasons": reasons,
         "customer_row": row_df,
         "explanation_df": exp_df,
-        "result_df": result_df
+        "result_df": result_df,
+        "customer_value": intelligence["customer_value"],
+        "priority_score": intelligence["priority_score"],
+        "priority_level": intelligence["priority_level"],
+        "recommended_action": intelligence["recommended_action"],
+        "suggested_channel": intelligence["suggested_channel"],
+        "business_reason": intelligence["business_reason"]
     }
 
 
@@ -263,6 +424,11 @@ def predict_batch(msisdn_df, artifacts):
                 "churn_probability": pred["probability"],
                 "prediction": pred["prediction"],
                 "risk_segment": pred["risk_segment"],
+                "customer_value": pred["customer_value"],
+                "priority_score": pred["priority_score"],
+                "priority_level": pred["priority_level"],
+                "recommended_action": pred["recommended_action"],
+                "suggested_channel": pred["suggested_channel"],
                 "status": "SUCCESS"
             })
 
