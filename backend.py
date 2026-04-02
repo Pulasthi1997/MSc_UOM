@@ -72,74 +72,6 @@ def find_best_threshold(y_true, y_prob):
     return float(best_threshold)
 
 
-def train_model_from_repo_data():
-    df = load_data()
-
-    train_df = df[df["churn_flag"].isin([0, 1])].copy()
-    if train_df.empty:
-        raise ValueError("No labeled rows found in churn_flag for training.")
-
-    train_df["churn_flag"] = train_df["churn_flag"].astype(int)
-
-    train_latest = prepare_latest_snapshot(train_df)
-
-    X = train_latest[FEATURES].copy()
-    y = train_latest["churn_flag"].copy()
-
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
-    )
-
-    pos = max(1, int((y_train == 1).sum()))
-    neg = max(1, int((y_train == 0).sum()))
-    class_weights = {0: 1.0, 1: neg / pos}
-
-    model = CatBoostClassifier(
-        iterations=500,
-        learning_rate=0.05,
-        depth=6,
-        loss_function="Logloss",
-        eval_metric="AUC",
-        verbose=False,
-        random_seed=42,
-        class_weights=class_weights
-    )
-
-    model.fit(X_train, y_train)
-
-    val_prob = model.predict_proba(X_val)[:, 1]
-    threshold = find_best_threshold(y_val, val_prob)
-
-    latest_snapshot = prepare_latest_snapshot(df).copy()
-    latest_snapshot["churn_probability"] = model.predict_proba(latest_snapshot[FEATURES])[:, 1]
-    latest_snapshot["prediction"] = np.where(
-        latest_snapshot["churn_probability"] >= threshold,
-        "CHURN",
-        "NON-CHURN"
-    )
-
-    latest_snapshot["risk_segment"] = latest_snapshot["churn_probability"].apply(
-        lambda x: classify_risk(x, threshold)
-    )
-
-    latest_snapshot["customer_value"] = latest_snapshot.apply(compute_customer_value, axis=1)
-    latest_snapshot["priority_score"] = latest_snapshot["churn_probability"] * latest_snapshot["customer_value"]
-    latest_snapshot["priority_level"] = latest_snapshot["priority_score"].apply(classify_priority)
-
-    intelligence_cols = latest_snapshot.apply(
-        lambda row: pd.Series(build_decision_intelligence_row(row, threshold)),
-        axis=1
-    )
-    latest_snapshot = pd.concat([latest_snapshot, intelligence_cols], axis=1)
-
-    return {
-        "model": model,
-        "threshold": threshold,
-        "latest_snapshot": latest_snapshot,
-        "features": FEATURES
-    }
-
-
 def classify_risk(prob, threshold):
     if prob >= threshold:
         return "HIGH RISK"
@@ -165,49 +97,6 @@ def classify_priority(score):
     elif score >= 15:
         return "MEDIUM"
     return "LOW"
-
-
-def get_services_for_msisdn(msisdn, artifacts):
-    df = artifacts["latest_snapshot"].copy()
-    msisdn = str(msisdn).strip()
-
-    services = (
-        df[df["MSISDN"] == msisdn]["SERVICE_NAME"]
-        .dropna()
-        .astype(str)
-        .sort_values()
-        .unique()
-        .tolist()
-    )
-    return services
-
-
-def explain_prediction(model, row_df, features):
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(row_df[features])
-
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
-
-    shap_row = shap_values[0]
-
-    exp_df = pd.DataFrame({
-        "feature": features,
-        "value": row_df[features].iloc[0].values,
-        "impact": shap_row
-    })
-
-    exp_df["abs_impact"] = exp_df["impact"].abs()
-    exp_df = exp_df.sort_values("abs_impact", ascending=False)
-
-    reasons = []
-    for _, r in exp_df.head(3).iterrows():
-        direction = "increased" if r["impact"] > 0 else "reduced"
-        reasons.append(
-            f"{r['feature']} = {round(float(r['value']), 4)} {direction} churn risk"
-        )
-
-    return exp_df, reasons
 
 
 def recommend_next_best_action(row, threshold):
@@ -281,6 +170,117 @@ def build_decision_intelligence_row(row, threshold):
         "suggested_channel": action_info["suggested_channel"],
         "business_reason": action_info["business_reason"]
     }
+
+
+def train_model_from_repo_data():
+    df = load_data()
+
+    train_df = df[df["churn_flag"].isin([0, 1])].copy()
+    if train_df.empty:
+        raise ValueError("No labeled rows found in churn_flag for training.")
+
+    train_df["churn_flag"] = train_df["churn_flag"].astype(int)
+
+    train_latest = prepare_latest_snapshot(train_df)
+
+    X = train_latest[FEATURES].copy()
+    y = train_latest["churn_flag"].copy()
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    pos = max(1, int((y_train == 1).sum()))
+    neg = max(1, int((y_train == 0).sum()))
+    class_weights = {0: 1.0, 1: neg / pos}
+
+    model = CatBoostClassifier(
+        iterations=500,
+        learning_rate=0.05,
+        depth=6,
+        loss_function="Logloss",
+        eval_metric="AUC",
+        verbose=False,
+        random_seed=42,
+        class_weights=class_weights
+    )
+
+    model.fit(X_train, y_train)
+
+    val_prob = model.predict_proba(X_val)[:, 1]
+    threshold = find_best_threshold(y_val, val_prob)
+
+    latest_snapshot = prepare_latest_snapshot(df).copy()
+    latest_snapshot["churn_probability"] = model.predict_proba(latest_snapshot[FEATURES])[:, 1]
+    latest_snapshot["prediction"] = np.where(
+        latest_snapshot["churn_probability"] >= threshold,
+        "CHURN",
+        "NON-CHURN"
+    )
+    latest_snapshot["risk_segment"] = latest_snapshot["churn_probability"].apply(
+        lambda x: classify_risk(x, threshold)
+    )
+
+    # Only create intelligence columns once
+    intelligence_cols = latest_snapshot.apply(
+        lambda row: pd.Series(build_decision_intelligence_row(row, threshold)),
+        axis=1
+    )
+
+    latest_snapshot = pd.concat([latest_snapshot, intelligence_cols], axis=1)
+
+    # Safety: remove any duplicate columns if they somehow appear
+    latest_snapshot = latest_snapshot.loc[:, ~latest_snapshot.columns.duplicated()].copy()
+
+    return {
+        "model": model,
+        "threshold": threshold,
+        "latest_snapshot": latest_snapshot,
+        "features": FEATURES
+    }
+
+
+def get_services_for_msisdn(msisdn, artifacts):
+    df = artifacts["latest_snapshot"].copy()
+    msisdn = str(msisdn).strip()
+
+    services = (
+        df[df["MSISDN"] == msisdn]["SERVICE_NAME"]
+        .dropna()
+        .astype(str)
+        .sort_values()
+        .unique()
+        .tolist()
+    )
+    return services
+
+
+def explain_prediction(model, row_df, features):
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(row_df[features])
+
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1]
+
+    shap_row = shap_values[0]
+
+    exp_df = pd.DataFrame({
+        "feature": features,
+        "value": row_df[features].iloc[0].values,
+        "impact": shap_row
+    })
+
+    exp_df["abs_impact"] = exp_df["impact"].abs()
+    exp_df = exp_df.sort_values("abs_impact", ascending=False)
+
+    reasons = []
+    for _, r in exp_df.head(3).iterrows():
+        direction = "increased" if r["impact"] > 0 else "reduced"
+        reasons.append(
+            f"{r['feature']} = {round(float(r['value']), 4)} {direction} churn risk"
+        )
+
+    return exp_df, reasons
 
 
 def simulate_what_if(row_df, model, features, threshold, action_name):
@@ -383,6 +383,7 @@ def predict_customer(msisdn, service_name, artifacts):
 
 def get_top_10_risky_customers(artifacts):
     df = artifacts["latest_snapshot"].copy()
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     return df.sort_values("churn_probability", ascending=False).head(10).copy()
 
 
