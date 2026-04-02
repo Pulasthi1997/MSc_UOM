@@ -292,9 +292,7 @@ def explain_prediction(model, row_df, features):
     reasons = []
     for _, r in exp_df.head(3).iterrows():
         direction = "increased" if r["impact"] > 0 else "reduced"
-        reasons.append(
-            f"{r['feature']} = {round(float(r['value']), 4)} {direction} churn risk"
-        )
+        reasons.append(f"{r['feature']} = {round(float(r['value']), 4)} {direction} churn risk")
 
     return exp_df, reasons
 
@@ -326,14 +324,12 @@ def simulate_what_if(row_df, model, features, threshold, action_name):
     before_risk = classify_risk(before_prob, threshold)
     after_risk = classify_risk(after_prob, threshold)
 
-    delta = after_prob - before_prob
-
     return {
         "before_probability": before_prob,
         "after_probability": after_prob,
         "before_risk": before_risk,
         "after_risk": after_risk,
-        "probability_change": delta,
+        "probability_change": after_prob - before_prob,
         "simulated_row": sim_df
     }
 
