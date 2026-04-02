@@ -109,6 +109,9 @@ def priority_badge(priority):
 
 artifacts = load_artifacts()
 
+st.title("Intelligent Customer Churn Analytics and Recommendation System")
+st.caption("Predict churn risk, explain customer behavior, and support business retention decisions.")
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Single Prediction",
     "Business Quick Prediction",
