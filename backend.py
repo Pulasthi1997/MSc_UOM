@@ -1,8 +1,6 @@
-import io
 import pandas as pd
 import numpy as np
 import shap
-import matplotlib.pyplot as plt
 
 from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
@@ -44,22 +42,25 @@ def load_data():
 
 
 def prepare_latest_snapshot(df):
-    sort_cols = ["MSISDN", "SERVICE_NAME"]
     if "MONTH_PRD" in df.columns:
-        sort_cols.append("MONTH_PRD")
+        latest_df = (
+            df.sort_values(["MSISDN", "SERVICE_NAME", "MONTH_PRD"])
+              .groupby(["MSISDN", "SERVICE_NAME"], as_index=False)
+              .tail(1)
+              .copy()
+        )
+    else:
+        latest_df = (
+            df.drop_duplicates(subset=["MSISDN", "SERVICE_NAME"], keep="last")
+              .copy()
+        )
 
-    latest_df = (
-        df.sort_values(sort_cols)
-          .groupby(["MSISDN", "SERVICE_NAME"], as_index=False)
-          .tail(1)
-          .copy()
-    )
     return latest_df
 
 
 def find_best_threshold(y_true, y_prob):
     thresholds = np.arange(0.05, 0.96, 0.01)
-    best_threshold = 0.5
+    best_threshold = 0.50
     best_f1 = -1
 
     for t in thresholds:
@@ -76,6 +77,9 @@ def train_model_from_repo_data():
     df = load_data()
 
     train_df = df[df["churn_flag"].isin([0, 1])].copy()
+    if train_df.empty:
+        raise ValueError("No labeled rows found in churn_flag for training.")
+
     train_df["churn_flag"] = train_df["churn_flag"].astype(int)
 
     train_latest = prepare_latest_snapshot(train_df)
@@ -107,12 +111,12 @@ def train_model_from_repo_data():
     val_prob = model.predict_proba(X_val)[:, 1]
     threshold = find_best_threshold(y_val, val_prob)
 
-    latest_snapshot = prepare_latest_snapshot(df)
-
-    latest_snapshot = latest_snapshot.copy()
+    latest_snapshot = prepare_latest_snapshot(df).copy()
     latest_snapshot["churn_probability"] = model.predict_proba(latest_snapshot[FEATURES])[:, 1]
     latest_snapshot["prediction"] = np.where(
-        latest_snapshot["churn_probability"] >= threshold, "CHURN", "NON-CHURN"
+        latest_snapshot["churn_probability"] >= threshold,
+        "CHURN",
+        "NON-CHURN"
     )
 
     return {
@@ -223,6 +227,7 @@ def get_top_10_risky_customers(artifacts):
 
 def predict_batch(msisdn_df, artifacts):
     results = []
+
     for _, r in msisdn_df.iterrows():
         msisdn = str(r["MSISDN"]).strip()
 
@@ -266,28 +271,3 @@ def predict_batch(msisdn_df, artifacts):
 
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode("utf-8")
-
-
-def create_gauge_chart(probability):
-    fig, ax = plt.subplots(figsize=(5, 2.8))
-    ax.axis("off")
-
-    theta = np.linspace(np.pi, 2 * np.pi, 200)
-    x = np.cos(theta)
-    y = np.sin(theta)
-
-    ax.plot(x, y, linewidth=18)
-
-    needle_angle = np.pi + (probability * np.pi)
-    needle_x = [0, 0.8 * np.cos(needle_angle)]
-    needle_y = [0, 0.8 * np.sin(needle_angle)]
-    ax.plot(needle_x, needle_y, linewidth=4)
-
-    ax.text(0, -0.2, f"{probability:.2%}", ha="center", va="center", fontsize=22, fontweight="bold")
-    ax.text(-1.0, -0.05, "0%", fontsize=10)
-    ax.text(0.9, -0.05, "100%", fontsize=10)
-
-    ax.set_xlim(-1.2, 1.2)
-    ax.set_ylim(-1.2, 0.3)
-
-    return fig
