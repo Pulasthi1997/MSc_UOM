@@ -1,6 +1,8 @@
+import io
 import pandas as pd
 import numpy as np
 import shap
+import matplotlib.pyplot as plt
 
 from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
@@ -24,7 +26,13 @@ DATA_FILE = "final_behavioural_table.xlsx"
 def load_data():
     df = pd.read_excel(DATA_FILE)
 
+    required_cols = ["MSISDN", "SERVICE_NAME", "churn_flag"] + FEATURES
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in Excel: {missing}")
+
     df["MSISDN"] = df["MSISDN"].astype(str).str.strip()
+    df["SERVICE_NAME"] = df["SERVICE_NAME"].astype(str).str.strip()
 
     if "MONTH_PRD" in df.columns:
         df["MONTH_PRD"] = pd.to_datetime(df["MONTH_PRD"], errors="coerce")
@@ -36,16 +44,16 @@ def load_data():
 
 
 def prepare_latest_snapshot(df):
+    sort_cols = ["MSISDN", "SERVICE_NAME"]
     if "MONTH_PRD" in df.columns:
-        latest_df = (
-            df.sort_values(["MSISDN", "MONTH_PRD"])
-              .groupby("MSISDN", as_index=False)
-              .tail(1)
-              .copy()
-        )
-    else:
-        latest_df = df.drop_duplicates(subset=["MSISDN"], keep="last").copy()
+        sort_cols.append("MONTH_PRD")
 
+    latest_df = (
+        df.sort_values(sort_cols)
+          .groupby(["MSISDN", "SERVICE_NAME"], as_index=False)
+          .tail(1)
+          .copy()
+    )
     return latest_df
 
 
@@ -66,9 +74,6 @@ def find_best_threshold(y_true, y_prob):
 
 def train_model_from_repo_data():
     df = load_data()
-
-    if "churn_flag" not in df.columns:
-        raise ValueError("Excel file must contain churn_flag column.")
 
     train_df = df[df["churn_flag"].isin([0, 1])].copy()
     train_df["churn_flag"] = train_df["churn_flag"].astype(int)
@@ -104,6 +109,12 @@ def train_model_from_repo_data():
 
     latest_snapshot = prepare_latest_snapshot(df)
 
+    latest_snapshot = latest_snapshot.copy()
+    latest_snapshot["churn_probability"] = model.predict_proba(latest_snapshot[FEATURES])[:, 1]
+    latest_snapshot["prediction"] = np.where(
+        latest_snapshot["churn_probability"] >= threshold, "CHURN", "NON-CHURN"
+    )
+
     return {
         "model": model,
         "threshold": threshold,
@@ -118,6 +129,21 @@ def classify_risk(prob, threshold):
     elif prob >= threshold * 0.7:
         return "MEDIUM RISK"
     return "LOW RISK"
+
+
+def get_services_for_msisdn(msisdn, artifacts):
+    df = artifacts["latest_snapshot"].copy()
+    msisdn = str(msisdn).strip()
+
+    services = (
+        df[df["MSISDN"] == msisdn]["SERVICE_NAME"]
+        .dropna()
+        .astype(str)
+        .sort_values()
+        .unique()
+        .tolist()
+    )
+    return services
 
 
 def explain_prediction(model, row_df, features):
@@ -141,18 +167,23 @@ def explain_prediction(model, row_df, features):
     reasons = []
     for _, r in exp_df.head(3).iterrows():
         direction = "increased" if r["impact"] > 0 else "reduced"
-        reasons.append(f"{r['feature']} = {round(float(r['value']), 4)} {direction} churn risk")
+        reasons.append(
+            f"{r['feature']} = {round(float(r['value']), 4)} {direction} churn risk"
+        )
 
     return exp_df, reasons
 
 
-def predict_customer(msisdn, artifacts):
+def predict_customer(msisdn, service_name, artifacts):
     msisdn = str(msisdn).strip()
+    service_name = str(service_name).strip()
 
     latest_snapshot = artifacts["latest_snapshot"].copy()
-    latest_snapshot["MSISDN"] = latest_snapshot["MSISDN"].astype(str).str.strip()
 
-    row_df = latest_snapshot[latest_snapshot["MSISDN"] == msisdn].copy()
+    row_df = latest_snapshot[
+        (latest_snapshot["MSISDN"] == msisdn) &
+        (latest_snapshot["SERVICE_NAME"] == service_name)
+    ].copy()
 
     if row_df.empty:
         return None
@@ -169,11 +200,94 @@ def predict_customer(msisdn, artifacts):
 
     exp_df, reasons = explain_prediction(model, row_df, artifacts["features"])
 
+    result_df = row_df.copy()
+    result_df["churn_probability"] = prob
+    result_df["prediction"] = "CHURN" if pred == 1 else "NON-CHURN"
+    result_df["risk_segment"] = risk
+
     return {
         "probability": prob,
         "prediction": "CHURN" if pred == 1 else "NON-CHURN",
         "risk_segment": risk,
         "reasons": reasons,
         "customer_row": row_df,
-        "explanation_df": exp_df
+        "explanation_df": exp_df,
+        "result_df": result_df
     }
+
+
+def get_top_10_risky_customers(artifacts):
+    df = artifacts["latest_snapshot"].copy()
+    return df.sort_values("churn_probability", ascending=False).head(10).copy()
+
+
+def predict_batch(msisdn_df, artifacts):
+    results = []
+    for _, r in msisdn_df.iterrows():
+        msisdn = str(r["MSISDN"]).strip()
+
+        service_name = None
+        if "SERVICE_NAME" in msisdn_df.columns and pd.notna(r.get("SERVICE_NAME")):
+            service_name = str(r["SERVICE_NAME"]).strip()
+
+        available = get_services_for_msisdn(msisdn, artifacts)
+
+        if not available:
+            results.append({
+                "MSISDN": msisdn,
+                "SERVICE_NAME": service_name if service_name else "",
+                "status": "NOT FOUND"
+            })
+            continue
+
+        if not service_name or service_name not in available:
+            service_name = available[0]
+
+        pred = predict_customer(msisdn, service_name, artifacts)
+
+        if pred is None:
+            results.append({
+                "MSISDN": msisdn,
+                "SERVICE_NAME": service_name,
+                "status": "NOT FOUND"
+            })
+        else:
+            results.append({
+                "MSISDN": msisdn,
+                "SERVICE_NAME": service_name,
+                "churn_probability": pred["probability"],
+                "prediction": pred["prediction"],
+                "risk_segment": pred["risk_segment"],
+                "status": "SUCCESS"
+            })
+
+    return pd.DataFrame(results)
+
+
+def convert_df_to_csv(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def create_gauge_chart(probability):
+    fig, ax = plt.subplots(figsize=(5, 2.8))
+    ax.axis("off")
+
+    theta = np.linspace(np.pi, 2 * np.pi, 200)
+    x = np.cos(theta)
+    y = np.sin(theta)
+
+    ax.plot(x, y, linewidth=18)
+
+    needle_angle = np.pi + (probability * np.pi)
+    needle_x = [0, 0.8 * np.cos(needle_angle)]
+    needle_y = [0, 0.8 * np.sin(needle_angle)]
+    ax.plot(needle_x, needle_y, linewidth=4)
+
+    ax.text(0, -0.2, f"{probability:.2%}", ha="center", va="center", fontsize=22, fontweight="bold")
+    ax.text(-1.0, -0.05, "0%", fontsize=10)
+    ax.text(0.9, -0.05, "100%", fontsize=10)
+
+    ax.set_xlim(-1.2, 1.2)
+    ax.set_ylim(-1.2, 0.3)
+
+    return fig
