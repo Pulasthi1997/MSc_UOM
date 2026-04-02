@@ -221,15 +221,11 @@ def train_model_from_repo_data():
         lambda x: classify_risk(x, threshold)
     )
 
-    # Only create intelligence columns once
     intelligence_cols = latest_snapshot.apply(
         lambda row: pd.Series(build_decision_intelligence_row(row, threshold)),
         axis=1
     )
-
     latest_snapshot = pd.concat([latest_snapshot, intelligence_cols], axis=1)
-
-    # Safety: remove any duplicate columns if they somehow appear
     latest_snapshot = latest_snapshot.loc[:, ~latest_snapshot.columns.duplicated()].copy()
 
     return {
@@ -238,6 +234,11 @@ def train_model_from_repo_data():
         "latest_snapshot": latest_snapshot,
         "features": FEATURES
     }
+
+
+def get_all_services(artifacts):
+    df = artifacts["latest_snapshot"].copy()
+    return sorted(df["SERVICE_NAME"].dropna().astype(str).unique().tolist())
 
 
 def get_services_for_msisdn(msisdn, artifacts):
@@ -253,6 +254,21 @@ def get_services_for_msisdn(msisdn, artifacts):
         .tolist()
     )
     return services
+
+
+def get_service_default_woe(service_name, artifacts):
+    df = artifacts["latest_snapshot"].copy()
+    service_name = str(service_name).strip()
+
+    service_rows = df[df["SERVICE_NAME"] == service_name].copy()
+
+    if service_rows.empty:
+        return 0.0
+
+    if "service_risk_woe" in service_rows.columns:
+        return float(service_rows["service_risk_woe"].median())
+
+    return 0.0
 
 
 def explain_prediction(model, row_df, features):
@@ -347,6 +363,69 @@ def predict_customer(msisdn, service_name, artifacts):
     risk = classify_risk(prob, threshold)
 
     exp_df, reasons = explain_prediction(model, row_df, artifacts["features"])
+
+    intelligence = build_decision_intelligence_row(
+        {**row_df.iloc[0].to_dict(), "churn_probability": prob},
+        threshold
+    )
+
+    result_df = row_df.copy()
+    result_df["churn_probability"] = prob
+    result_df["prediction"] = "CHURN" if pred == 1 else "NON-CHURN"
+    result_df["risk_segment"] = risk
+    result_df["customer_value"] = intelligence["customer_value"]
+    result_df["priority_score"] = intelligence["priority_score"]
+    result_df["priority_level"] = intelligence["priority_level"]
+    result_df["recommended_action"] = intelligence["recommended_action"]
+    result_df["suggested_channel"] = intelligence["suggested_channel"]
+    result_df["business_reason"] = intelligence["business_reason"]
+
+    return {
+        "probability": prob,
+        "prediction": "CHURN" if pred == 1 else "NON-CHURN",
+        "risk_segment": risk,
+        "reasons": reasons,
+        "customer_row": row_df,
+        "explanation_df": exp_df,
+        "result_df": result_df,
+        "customer_value": intelligence["customer_value"],
+        "priority_score": intelligence["priority_score"],
+        "priority_level": intelligence["priority_level"],
+        "recommended_action": intelligence["recommended_action"],
+        "suggested_channel": intelligence["suggested_channel"],
+        "business_reason": intelligence["business_reason"]
+    }
+
+
+def predict_business_input(service_name, months_stayed, avg_spend_per_month, artifacts):
+    model = artifacts["model"]
+    threshold = artifacts["threshold"]
+    features = artifacts["features"]
+
+    avg_spend_per_month = float(avg_spend_per_month)
+    months_stayed = int(months_stayed)
+    service_risk_woe = get_service_default_woe(service_name, artifacts)
+
+    row_df = pd.DataFrame([{
+        "SERVICE_NAME": service_name,
+        "tot_amount_w_tax": avg_spend_per_month,
+        "spend_lag_1": avg_spend_per_month,
+        "spend_lag_2": avg_spend_per_month,
+        "spend_lag_3": avg_spend_per_month,
+        "spend_avg_last3": avg_spend_per_month,
+        "spend_std_last3": 0.0,
+        "spend_trend_ratio": 1.0,
+        "consecutive_active_months": months_stayed,
+        "service_risk_woe": service_risk_woe
+    }])
+
+    X_input = row_df[features].copy().fillna(0)
+
+    prob = float(model.predict_proba(X_input)[:, 1][0])
+    pred = int(prob >= threshold)
+    risk = classify_risk(prob, threshold)
+
+    exp_df, reasons = explain_prediction(model, row_df, features)
 
     intelligence = build_decision_intelligence_row(
         {**row_df.iloc[0].to_dict(), "churn_probability": prob},
