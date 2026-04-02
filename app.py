@@ -4,7 +4,9 @@ import streamlit as st
 from backend import (
     train_model_from_repo_data,
     get_services_for_msisdn,
+    get_all_services,
     predict_customer,
+    predict_business_input,
     get_top_10_risky_customers,
     predict_batch,
     convert_df_to_csv,
@@ -107,8 +109,9 @@ def priority_badge(priority):
 
 artifacts = load_artifacts()
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Single Prediction",
+    "Business Quick Prediction",
     "Top 10 Risky Customers",
     "Batch Upload",
     "Decision Intelligence"
@@ -157,23 +160,17 @@ with tab1:
                     st.write(f"{i}. {reason}")
 
                 st.subheader("Customer Details")
-                show_cols = [
-                    c for c in ["MSISDN", "SERVICE_NAME", "MONTH_PRD"]
-                    if c in result["customer_row"].columns
-                ]
+                show_cols = [c for c in ["MSISDN", "SERVICE_NAME", "MONTH_PRD"] if c in result["customer_row"].columns]
                 if show_cols:
-                    st.dataframe(result["customer_row"][show_cols], use_container_width=True)
+                    st.dataframe(result["customer_row"][show_cols], width="stretch")
 
                 st.subheader("Feature Values Used")
-                st.dataframe(
-                    result["customer_row"][artifacts["features"]],
-                    use_container_width=True
-                )
+                st.dataframe(result["customer_row"][artifacts["features"]], width="stretch")
 
                 st.subheader("Top Feature Contributions")
                 st.dataframe(
                     result["explanation_df"][["feature", "value", "impact"]].head(10),
-                    use_container_width=True
+                    width="stretch"
                 )
 
                 csv_data = convert_df_to_csv(result["result_df"])
@@ -186,6 +183,57 @@ with tab1:
                 )
 
 with tab2:
+    st.caption("Business user can estimate churn using service, months stayed, and average monthly spend")
+
+    all_services = get_all_services(artifacts)
+    selected_service = st.selectbox("Select Service Name", all_services, key="business_service")
+    months_stayed = st.number_input("Number of Months Stayed", min_value=1, max_value=120, value=6, step=1)
+    avg_spend = st.number_input("Average Spent per Month", min_value=0.0, value=100.0, step=10.0)
+
+    business_predict_btn = st.button("Run Business Prediction", key="business_predict_btn")
+
+    if business_predict_btn:
+        result = predict_business_input(
+            service_name=selected_service,
+            months_stayed=months_stayed,
+            avg_spend_per_month=avg_spend,
+            artifacts=artifacts
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Churn Probability", f"{result['probability']:.2%}")
+        c2.metric("Prediction", result["prediction"])
+        c3.markdown(risk_badge(result["risk_segment"]), unsafe_allow_html=True)
+        c4.markdown(priority_badge(result["priority_level"]), unsafe_allow_html=True)
+
+        st.subheader("Business Recommendation")
+        st.markdown(f"""
+        <div class="info-box">
+            <b>Recommended Action:</b> {result["recommended_action"]}<br>
+            <b>Suggested Channel:</b> {result["suggested_channel"]}<br>
+            <b>Business Reason:</b> {result["business_reason"]}
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.subheader("Derived Feature Values")
+        st.dataframe(result["customer_row"], width="stretch")
+
+        st.subheader("Top Feature Contributions")
+        st.dataframe(
+            result["explanation_df"][["feature", "value", "impact"]].head(10),
+            width="stretch"
+        )
+
+        business_csv = convert_df_to_csv(result["result_df"])
+        safe_service = str(selected_service).replace(" ", "_").replace("/", "_")
+        st.download_button(
+            "Download Business Prediction Result as CSV",
+            data=business_csv,
+            file_name=f"business_prediction_{safe_service}.csv",
+            mime="text/csv"
+        )
+
+with tab3:
     st.caption("Highest predicted churn risk customers")
 
     top10 = get_top_10_risky_customers(artifacts)
@@ -196,7 +244,7 @@ with tab2:
     ]
     show_cols = [c for c in show_cols if c in top10.columns]
 
-    st.dataframe(top10[show_cols], use_container_width=True)
+    st.dataframe(top10[show_cols], width="stretch")
 
     csv_top10 = convert_df_to_csv(top10[show_cols])
     st.download_button(
@@ -206,7 +254,7 @@ with tab2:
         mime="text/csv"
     )
 
-with tab3:
+with tab4:
     st.caption("Upload a CSV with MSISDN column. SERVICE_NAME column is optional.")
 
     batch_file = st.file_uploader("Upload CSV", type=["csv"], key="batch_file")
@@ -215,7 +263,7 @@ with tab3:
         batch_df = pd.read_csv(batch_file)
 
         st.write("Uploaded Data")
-        st.dataframe(batch_df.head(), use_container_width=True)
+        st.dataframe(batch_df.head(), width="stretch")
 
         if "MSISDN" not in batch_df.columns:
             st.error("CSV must contain an `MSISDN` column.")
@@ -223,7 +271,7 @@ with tab3:
             batch_result = predict_batch(batch_df, artifacts)
 
             st.subheader("Batch Prediction Results")
-            st.dataframe(batch_result, use_container_width=True)
+            st.dataframe(batch_result, width="stretch")
 
             csv_batch = convert_df_to_csv(batch_result)
             st.download_button(
@@ -233,7 +281,7 @@ with tab3:
                 mime="text/csv"
             )
 
-with tab4:
+with tab5:
     st.caption("AI-powered business decision support for retention strategy")
 
     msisdn_intel = st.text_input(
@@ -320,7 +368,7 @@ with tab4:
                     "SIMULATION_CHANGE": sim["probability_change"]
                 }])
 
-                st.dataframe(summary_df, use_container_width=True)
+                st.dataframe(summary_df, width="stretch")
 
                 intelligence_csv = convert_df_to_csv(summary_df)
                 safe_service = str(intel_service).replace(" ", "_").replace("/", "_")
